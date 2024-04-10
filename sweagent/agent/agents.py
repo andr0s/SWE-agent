@@ -1,3 +1,5 @@
+import datetime
+from doctest import debug
 import json
 import re
 import logging
@@ -19,8 +21,23 @@ from sweagent.environment.utils import LOGGER_NAME
 from sweagent.environment.swe_env import SWEEnv
 from tenacity import RetryError
 from typing import Optional, Tuple, Any
+from inspect import currentframe
 
 logger = logging.getLogger(LOGGER_NAME)
+
+
+
+_LAST_TIME = datetime.datetime.now()
+
+
+def debug_time(name=""):
+    """Display time delta at line number"""
+    cf = currentframe()
+    line_no = cf.f_back.f_lineno
+    global _LAST_TIME
+    time_delta = datetime.datetime.now() - _LAST_TIME
+    _LAST_TIME = datetime.datetime.now()
+    logger.debug(f"Time: {time_delta} at line {line_no} ({name=})") 
 
 
 @dataclass(frozen=True)
@@ -370,6 +387,7 @@ class Agent:
         self.command_patterns[self.config.submit_command] = submit_pat
 
     def forward(self, observation: str, available_actions: list[str], state: str) -> Tuple[str, str, str]:
+        debug_time()
         thought, action, output = self.forward_with_error_check(observation, state)
 
         self.history.append(
@@ -390,6 +408,7 @@ class Agent:
         """Query the model with the current state and observation with the appropriate template.
 
         Returns the model output."""
+        debug_time()
 
         state_vars = json.loads(state)
 
@@ -424,6 +443,7 @@ class Agent:
         logger.info(f"🤖 MODEL INPUT\n{message}")
         self.history.append({"role": "user", "content": message, "agent": self.name})
 
+        debug_time()
         return self.model.query(self.local_history)
 
     def retry_after_format_fail(self, output):
@@ -474,6 +494,7 @@ class Agent:
 
         Returns the thought, action, and raw model output.
         """
+        debug_time()
         # Condition for handling outputs with no thought (just action)
         if self.model.args.model_name == "human":
             return "", output, output
@@ -505,7 +526,9 @@ class Agent:
                 output = self.retry_after_blocklist_fail(output, action)
             else:
                 return thought, action, output
+        logger.debug("format fails %d, blocklist fails %d", format_fails, blocklist_fails)
         logger.warning(f"Malformat limit reached: \n{output}")
+        debug_time()
         return "Exit due to format error", "exit_format", output
 
     def forward_with_error_check(self, observation: str, state: str) -> Tuple[str, str, str]:
@@ -641,13 +664,17 @@ class Agent:
         trajectory = []
         info = {}
         while not done:
+            debug_time()
             state = env.communicate(self.state_command) if self.state_command else None
+            debug_time("state cmd")
             thought, action, output = self.forward(
                 observation,
                 env.get_available_actions(),
                 state)
+            debug_time("reset before postproc")
             observations = list()
             run_action = self._guard_multiline_input(action)
+            debug_time("guard multiline")
             for sub_action in self.split_actions(run_action):
                 if sub_action['agent'] == self.name or sub_action['cmd_name'] == self.config.submit_command:
                     obs, _, done, info = env.step(sub_action['action'])
@@ -662,6 +689,7 @@ class Agent:
                     observations.append(sub_agent_output)
 
             observation = '\n'.join([obs for obs in observations if obs is not None])
+            debug_time("got observation")
 
             trajectory.append(
                 {
@@ -675,6 +703,7 @@ class Agent:
             info['model_stats'] = self.model.stats.to_dict()
             if traj_dir:
                 self.save_trajectory(trajectory, traj_dir, env, info)
+                debug_time("traj saved")
         if return_type == "info":
             return info
         if return_type == "info_trajectory":
