@@ -1,3 +1,4 @@
+import hashlib
 import shlex
 import docker
 import json
@@ -17,30 +18,43 @@ from ghapi.all import GhApi
 from io import BytesIO
 from pathlib import Path
 from subprocess import PIPE, STDOUT
-from typing import List, Set, Tuple, Dict
+from typing import Any, List, Optional, Set, Tuple, Dict, Union
+
+from git import InvalidGitRepositoryError, Repo
 
 LOGGER_NAME = "intercode"
 START_UP_DELAY = 5
 TIMEOUT_DURATION = 25
 GITHUB_ISSUE_URL_PATTERN = re.compile(r'github\.com\/(.*?)\/(.*?)\/issues\/(\d+)')
+GITHUB_REPO_URL_PATTERN = re.compile(r'.*[/@]?github\.com\/([^/]+)\/([^/]+)')
 
 logger = logging.getLogger(LOGGER_NAME)
 
 
 def get_data_path_name(data_path: str):
-    # if data_path is a file, return the file stem
-    # elif it's a github url, return the owner__repo_name
+    """ if data_path is a file, return the file stem
+    elif it's a github url, return the owner__repo_name
+    """
     match = GITHUB_ISSUE_URL_PATTERN.search(data_path)
     if match:
-        owner, repo, issue_number = match.groups()
+        owner, repo, _ = match.groups()
         return f"{owner}__{repo}"
     return Path(data_path).stem
 
 
-def is_from_github_url(data_path: str):
+def is_github_issue_url(data_path: str) -> bool:
+    """Check if data_path is an URL pointing to a github issue"""
     return GITHUB_ISSUE_URL_PATTERN.search(data_path) is not None
 
 
+def is_github_repo_url(data_path: str) -> bool:
+    """Check if data_path is an URL pointing to a github repository.
+    Paths to issues or PRs will also match this pattern.
+    """
+    return GITHUB_REPO_URL_PATTERN.search(data_path) is not None
+
+
+# todo: Why not just use copy_anything_to_container?
 def copy_file_to_container(container, contents, container_path):
     """
     Copies a given string into a Docker container at a specified path.
@@ -84,6 +98,23 @@ def copy_file_to_container(container, contents, container_path):
         # Cleanup: Remove the temporary file if it was created
         if temp_file_name and os.path.exists(temp_file_name):
             os.remove(temp_file_name)
+
+
+def copy_anything_to_container(container, host_path: str, container_path: str) -> None:
+    """Copy files or directories from host to container
+    
+    Note: Will need to set ownership on the copied files in the container.
+    """
+    if not Path(host_path).exists():
+        msg = f"Path {host_path} does not exist, cannot copy it to container."
+        raise FileNotFoundError(msg)
+    cmd = ["docker", "cp", host_path, f"{container.id}:{container_path}"]
+    logger.debug(f"Copying {host_path} to container at {container_path} with command: {shlex.join(cmd)}")
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        msg = f"Error copying {host_path} to container at {container_path}: {e}"
+        raise RuntimeError(msg) from e
 
 
 def read_with_timeout(container, pid_func, timeout_duration):
@@ -329,12 +360,12 @@ def parse_gh_issue_url(issue_url: str) -> Tuple[str, str, str]:
 
 def parse_gh_repo_url(repo_url: str) -> Tuple[str, str]:
     """Return owner, repo from repo url"""
-    if not repo_url.startswith('http://') and not repo_url.startswith('https://'):
-        repo_url = 'https://' + repo_url
-    parts = repo_url.split('/')
-    owner = parts[3] 
-    repo = parts[4]
-    return owner, repo
+    match = GITHUB_REPO_URL_PATTERN.search(repo_url)
+    if not match:
+        raise InvalidGithubURL(f"Invalid GitHub issue URL: {repo_url}")
+    res = match.groups()
+    assert len(res) == 2
+    return tuple(res)  # type: ignore
 
 
 def get_gh_issue_data(issue_url: str, *, token: str = ""):
@@ -347,42 +378,119 @@ def get_gh_issue_data(issue_url: str, *, token: str = ""):
     return api.issues.get(owner, repo, issue_number)
 
 
-def get_instances(file_path: str, base_commit: str = None, split: str = None, token: str = None):
+
+def get_problem_statement_from_github_issue(owner: str, repo: str, issue_number: str, *, token: Optional[str] = "") -> str:
+    """Return problem statement from github issue"""
+    api = GhApi(token=token)
+    issue = api.issues.get(owner, repo, issue_number)
+    title = issue.title if issue.title else ""
+    body = issue.body if issue.body else ""
+    return f"{title}\n{body}\n"
+
+
+def get_instance_from_github_url(url: str, *, base_commit: Optional[str]=None, problem_statement: str="", token: Optional[str] = None) -> dict[str, Any]:
+    """Get instance from a github URL (either issue or repo)"""
+    try: 
+        owner, repo, issue_number = parse_gh_issue_url(url)
+    except InvalidGithubURL:
+        owner, repo = parse_gh_repo_url(url)
+        issue_number = None
+    record = dict()
+    record["repo"] = f"{owner}/{repo}"
+    if base_commit:
+        record["base_commit"] = base_commit
+    else:
+        api = GhApi(token=token)
+        record["base_commit"] = get_commit(api, owner, repo, base_commit).sha
+    record["version"] = record["base_commit"][:7]
+    if not problem_statement:
+        if not issue_number:
+            msg = "Problem statement must be provided if data_path is a github repo url without an issue number."
+            raise ValueError(msg)
+        record["problem_statement"] = get_problem_statement_from_github_issue(owner, repo, issue_number, token=token)
+    else:
+        record["problem_statement"] = problem_statement
+    if issue_number is not None:
+        record["instance_id"] = f"{owner}__{repo}-i{issue_number}"
+    else:
+        # Get a unique ID by hashing the problem statement
+        ps_hash = hashlib.sha256(problem_statement.encode()).hexdigest()[:6]
+        record["instance_id"] = f"{owner}__{repo}-{ps_hash}"
+    return record
+
+
+def get_instance_from_local_dir(data_path: Union[str, os.PathLike], *, problem_statement: str) -> Dict[str, Any]:
+    """Get task instance from a local directory"""
+    if not problem_statement:
+        msg = "Problem statement must be provided if data_path is a local directory."
+        raise ValueError(msg)
+    data_path = Path(data_path).resolve()
+    if not data_path.is_dir():
+        msg = "data_path must be a directory"
+        raise ValueError(msg)
+    try:
+        repo = Repo(data_path, search_parent_directories=True)
+    except InvalidGitRepositoryError as e:
+        msg = "data_path must be a git repository"
+        raise ValueError(msg) from e
+    # The instance id is made up of the hash of the parent directory, the sanitized directory name
+    # and the hash of the problem statement
+    iid = hashlib.sha256(str(data_path.parent).encode()).hexdigest()[:6]
+    iid += "__"+ "".join(x for x in data_path.stem if x.isalnum())
+    iid += "-" + hashlib.sha256(problem_statement.encode()).hexdigest()[:6]
+    base_commit = repo.head.object.hexsha
+    return {
+        "repo": f"local://{data_path}",
+        "base_commit": base_commit,
+        "version": base_commit[:7],
+        "problem_statement": problem_statement,
+        "instance_id": iid,
+    }
+
+
+def get_instances(
+        file_path: str, 
+        base_commit: Optional[str] = None, 
+        split: Optional[str] = None, 
+        token: Optional[str] = None,
+        *,
+        problem_statement: str = "",
+    ) -> List[Dict[str, Any]]:
     """
     Getter function for handling json, jsonl files
 
-    Arguments:
+    Args:
         file_path (str): Path to file
+        problem_statement: Problem statement when running on github repository URL
+            or local path. If running on github issue, will replace issue content.
+
     Returns:
         List of instances
     """
+
     # If file_path is a directory, attempt load from disk
     if os.path.isdir(file_path):
-        dataset_or_dict = load_from_disk(file_path)
-        if isinstance(dataset_or_dict, dict):
-            return dataset_or_dict[split]
-        return dataset_or_dict
+        try:
+            dataset_or_dict = load_from_disk(file_path)
+            if isinstance(dataset_or_dict, dict):
+                return dataset_or_dict[split]
+            return dataset_or_dict
+        except FileNotFoundError:
+            # Raised by load_from_disk if the directory is not a dataset directory
+            pass
+    
+    if Path(file_path).is_dir():
+        if base_commit is not None:
+            msg = "base_commit must be None if data_path is a local directory"
+            raise ValueError(msg)
+        return [get_instance_from_local_dir(file_path, problem_statement=problem_statement)]
 
     # If file_path is a github issue url, fetch the issue and return a single instance
-    if is_from_github_url(file_path):
-        try: 
-            owner, repo, issue_number = parse_gh_issue_url(file_path)
-        except InvalidGithubURL:
-            pass
-        else:
-            record = dict()
-            api = GhApi(token=token)
-            issue = api.issues.get(owner, repo, issue_number)
-            title = issue.title if issue.title else ""
-            body = issue.body if issue.body else ""
-            text = f"{title}\n{body}\n"
-            record["repo"] = f"{owner}/{repo}"
-            record["base_commit"] = base_commit if base_commit else get_commit(api, owner, repo, base_commit).sha
-            record["version"] = record["base_commit"][:7]
-            record["problem_statement"] = text
-            record["instance_id"] = f"{owner}__{repo}-i{issue_number}"
-            return [record,]
-    elif base_commit is not None:
+    if is_github_repo_url(file_path):
+        record = get_instance_from_github_url(file_path, base_commit=base_commit, problem_statement=problem_statement, token=token)
+        return [record,]
+    
+    if base_commit is not None:
         raise ValueError("base_commit must be None if data_path is not a github issue url")
 
     # If file_path is a file, load the file
@@ -390,6 +498,10 @@ def get_instances(file_path: str, base_commit: str = None, split: str = None, to
         return json.load(open(file_path))
     if file_path.endswith(".jsonl"):
         return [json.loads(x) for x in open(file_path, 'r').readlines()]
+
+    if problem_statement:
+        msg = "problem_statement must be empty if data_path is not a github url or local repo url"
+        raise ValueError(msg)
 
     # Attempt load from HF datasets as a last resort
     try:
